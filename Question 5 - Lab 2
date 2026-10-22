@@ -1,0 +1,223 @@
+/*
+ * ECNG 3006 - Microprocessors 2
+ * Demonstration Cyclic Executive (Williams, Ch. 4, Section 4.7)
+ * ported from Linux to the Arduino MKR ZERO (SAMD21).
+ *
+ * Name : Kaeden Hull
+ * ID   : 816045523
+ *
+ * Changes from the textbook version:
+ *  - printf()  -> Arduino Serial library (prints over the USB port)
+ *  - times()   -> my_times(): returns ms ticks counted by the TC4 interrupt
+ *  - sleep()   -> my_sleep(): waits on the ms ticks from TC4
+ *  - TC4 is set up with <sam.h> registers to interrupt every 1 ms, and the
+ *    ISR increments a time structure (ms, seconds, minutes).
+ */
+
+#include <Arduino.h>    /* used ONLY for Serial */
+#include <sam.h>        /* register definitions for the timer */
+
+#define SLOTX   4       /* number of slots                     */
+#define CYCLEX  5       /* tasks per slot                      */
+#define SLOT_T  5000    /* slot time in ms (5 s)               */
+#define TPS     1000    /* timer ticks per second (1 ms tick)  */
+
+/* Time structure updated by the timer ISR */
+struct time_struct {
+    uint32_t ticks;     /* ms since start-up */
+    uint16_t ms;        /* 0 - 999           */
+    uint8_t  sec;       /* 0 - 59            */
+    uint8_t  min;       /* 0 - 59            */
+};
+
+volatile struct time_struct sys_time = {0, 0, 0, 0};
+
+int cycle = 0;
+int slot = 0;
+uint32_t now, then;
+
+/* ------------------------------------------------------------------ */
+/* Timer: TC4, 48 MHz / 64 = 750 kHz, count 0..749 -> 1 ms interrupt  */
+/* ------------------------------------------------------------------ */
+void timer_init(void)
+{
+    /* Turn on the bus clock for TC4 */
+    PM->APBCMASK.reg |= PM_APBCMASK_TC4;
+
+    /* Connect the 48 MHz clock (GCLK0) to TC4 */
+    GCLK->CLKCTRL.reg = GCLK_CLKCTRL_ID_TC4_TC5 |
+                        GCLK_CLKCTRL_GEN_GCLK0 |
+                        GCLK_CLKCTRL_CLKEN;
+    while (GCLK->STATUS.bit.SYNCBUSY);
+
+    /* Reset the timer */
+    TC4->COUNT16.CTRLA.reg = TC_CTRLA_SWRST;
+    while (TC4->COUNT16.CTRLA.bit.SWRST);
+
+    /* 16-bit mode, reset counter when it matches CC0, divide clock by 64 */
+    TC4->COUNT16.CTRLA.reg = TC_CTRLA_MODE_COUNT16 |
+                             TC_CTRLA_WAVEGEN_MFRQ |
+                             TC_CTRLA_PRESCALER_DIV64;
+    while (TC4->COUNT16.STATUS.bit.SYNCBUSY);
+
+    /* 750 counts = 1 ms */
+    TC4->COUNT16.CC[0].reg = 749;
+    while (TC4->COUNT16.STATUS.bit.SYNCBUSY);
+
+    /* Enable the match interrupt in the timer and in the NVIC */
+    TC4->COUNT16.INTENSET.reg = TC_INTENSET_MC0;
+    NVIC_EnableIRQ(TC4_IRQn);
+
+    /* Start the timer */
+    TC4->COUNT16.CTRLA.reg |= TC_CTRLA_ENABLE;
+    while (TC4->COUNT16.STATUS.bit.SYNCBUSY);
+}
+
+/* Timer ISR - runs every 1 ms and updates the time structure.
+ * extern "C" is needed because this file is C++ (for Serial) and the
+ * ISR name must match the vector table name exactly. */
+extern "C" void TC4_Handler(void)
+{
+    TC4->COUNT16.INTFLAG.reg = TC_INTFLAG_MC0;   /* clear the flag */
+
+    sys_time.ticks++;
+    sys_time.ms++;
+
+    if (sys_time.ms >= 1000) {
+        sys_time.ms = 0;
+        sys_time.sec++;
+
+        if (sys_time.sec >= 60) {
+            sys_time.sec = 0;
+            sys_time.min++;
+
+            if (sys_time.min >= 60) {
+                sys_time.min = 0;
+            }
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Time and sleep functions                                           */
+/* ------------------------------------------------------------------ */
+
+/* Returns the number of ms ticks since start-up (replaces times()) */
+uint32_t my_times(void)
+{
+    return sys_time.ticks;
+}
+
+/* Waits for the given number of seconds (replaces sleep()) */
+void my_sleep(uint32_t seconds)
+{
+    uint32_t start = my_times();
+
+    while ((my_times() - start) < (seconds * TPS)) {
+        /* wait */
+    }
+}
+
+/* Prints the time structure as [min:sec.ms] */
+void print_time(void)
+{
+    Serial.print("[");
+    Serial.print(sys_time.min);
+    Serial.print(":");
+    Serial.print(sys_time.sec);
+    Serial.print(".");
+    Serial.print(sys_time.ms);
+    Serial.print("] ");
+}
+
+/* ------------------------------------------------------------------ */
+/* Tasks                                                              */
+/* ------------------------------------------------------------------ */
+void one()
+{
+    print_time();
+    Serial.println("task 1 running");
+    my_sleep(1);
+}
+
+void two()
+{
+    print_time();
+    Serial.println("task 2 running");
+    my_sleep(2);
+}
+
+void three()
+{
+    print_time();
+    Serial.println("task 3 running");
+    my_sleep(3);
+}
+
+void four()
+{
+    print_time();
+    Serial.println("task 4 running");
+    my_sleep(4);
+}
+
+void five()
+{
+    print_time();
+    Serial.println("task 5 running");
+    my_sleep(5);
+}
+
+/* Waits out the rest of the 5 s slot, then moves to the next slot */
+void burn()
+{
+    uint32_t bstart = my_times();
+
+    while (((now = my_times()) - then) < (uint32_t)SLOT_T * TPS / 1000) {
+        /* burn time here */
+    }
+
+    print_time();
+    Serial.print("burn time = ");
+    Serial.print((my_times() - bstart) * 1000 / TPS);
+    Serial.println(" ms");
+    Serial.println();
+
+    then = now;
+    cycle = CYCLEX;     /* skip the rest of this slot */
+}
+
+/* Task table - each row is one slot */
+void (*ttable[SLOTX][CYCLEX])() = {
+    {one,  two,   burn, burn, burn},
+    {one,  three, burn, burn, burn},
+    {one,  four,  burn, burn, burn},
+    {burn, burn,  burn, burn, burn}
+};
+
+/* ------------------------------------------------------------------ */
+/* setup() runs once, loop() runs forever (replaces main and while(1)) */
+/* ------------------------------------------------------------------ */
+void setup()
+{
+    Serial.begin(9600);
+    while (!Serial);        /* wait for the serial monitor to open */
+
+    timer_init();
+
+    Serial.println("ECNG 3006 Cyclic Executive - Kaeden Hull - 816045523");
+    Serial.print("clock ticks/sec = ");
+    Serial.println(TPS);
+    Serial.println();
+
+    then = my_times();      /* first slot starts now */
+}
+
+void loop()
+{
+    for (slot = 0; slot < SLOTX; slot++) {
+        for (cycle = 0; cycle < CYCLEX; cycle++) {
+            (*ttable[slot][cycle])();   /* dispatch next task from table */
+        }
+    }
+}
